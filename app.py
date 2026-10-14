@@ -5,10 +5,15 @@ Run with:  streamlit run app.py
 
 Lets the user:
 - Upload their own transaction-level CSV (or use the bundled Superstore data)
-- View EDA (daily trend, category/region breakdown)
-- Pick a forecast horizon
+- View EDA (weekly trend, category/region breakdown)
+- Pick a forecast horizon (in weeks)
 - See the forecast chart + table
 - Download the forecast as CSV
+
+NOTE: forecasting is done on WEEKLY-aggregated sales, not daily. Benchmarking
+showed weekly aggregation roughly halves relative forecast error compared to
+daily (noisy day-to-day sales were hard for any model to predict well) - see
+README.md "Results" section for the before/after comparison.
 """
 
 import streamlit as st
@@ -21,6 +26,7 @@ from sales_forecast_utils import (
     add_features,
     get_feature_cols,
     recursive_forecast,
+    check_model_compatibility,
 )
 
 st.set_page_config(page_title="Sales Forecasting", layout="wide")
@@ -51,7 +57,7 @@ def load_and_aggregate(file):
 st.sidebar.header("Settings")
 
 uploaded_file = st.sidebar.file_uploader("Upload transaction CSV", type=["csv"])
-horizon = st.sidebar.slider("Forecast horizon (days)", min_value=7, max_value=90, value=30, step=7)
+horizon = st.sidebar.slider("Forecast horizon (weeks)", min_value=4, max_value=52, value=12, step=4)
 
 model = load_model(MODEL_PATH)
 if model is None:
@@ -64,25 +70,25 @@ if uploaded_file is None and not os.path.exists("Superstore.csv"):
     st.error("No file uploaded and no default 'Superstore.csv' found. Please upload a CSV.")
     st.stop()
 
-raw, daily = load_and_aggregate(data_source)
+raw, weekly = load_and_aggregate(data_source)
 
 # ------------------------------------------------------------------
 # Main layout
 # ------------------------------------------------------------------
 st.title("📈 Sales Forecasting Dashboard")
-st.caption("Upload your transaction data, or use the bundled dataset, to see historical trends and a forward forecast.")
+st.caption("Upload your transaction data, or use the bundled dataset, to see historical trends and a forward forecast. Forecasting runs on weekly-aggregated sales.")
 
 col1, col2, col3 = st.columns(3)
-col1.metric("Total historical sales", f"${daily['sales'].sum():,.0f}")
-col2.metric("Days of data", f"{daily.shape[0]:,}")
-col3.metric("Avg daily sales", f"${daily['sales'].mean():,.0f}")
+col1.metric("Total historical sales", f"${weekly['sales'].sum():,.0f}")
+col2.metric("Weeks of data", f"{weekly.shape[0]:,}")
+col3.metric("Avg weekly sales", f"${weekly['sales'].mean():,.0f}")
 
 tab_eda, tab_forecast = st.tabs(["📊 Exploratory Data", "🔮 Forecast"])
 
 # ---------------- EDA TAB ----------------
 with tab_eda:
-    st.subheader("Daily Sales Trend")
-    st.line_chart(daily.set_index("date")["sales"])
+    st.subheader("Weekly Sales Trend")
+    st.line_chart(weekly.set_index("date")["sales"])
 
     if "Category" in raw.columns:
         st.subheader("Sales by Category")
@@ -94,28 +100,37 @@ with tab_eda:
         region_sales = raw.groupby("Region")["Sales"].sum().sort_values(ascending=False)
         st.bar_chart(region_sales)
 
-    zero_pct = (daily["sales"] == 0).mean() * 100
-    st.info(f"{zero_pct:.1f}% of days in this dataset have zero recorded sales — "
-            f"keep this in mind when judging forecast accuracy.")
+    st.info("Forecasting is done on weekly-aggregated sales rather than daily — "
+            "daily totals were too noisy for any model to predict well "
+            "(see README.md for the before/after comparison).")
 
 # ---------------- FORECAST TAB ----------------
 with tab_forecast:
-    st.subheader(f"Forecast - Next {horizon} Days")
+    st.subheader(f"Forecast - Next {horizon} Weeks")
 
-    featured = add_features(daily).dropna().reset_index(drop=True)
+    featured = add_features(weekly).dropna().reset_index(drop=True)
     feature_cols = get_feature_cols(featured)
 
-    # Guard: the uploaded data must have the same feature set the model was trained on
-    missing = [c for c in feature_cols if c not in featured.columns]
-    if missing:
-        st.error(f"Uploaded data can't produce required features: {missing}")
+    # Guard: the saved model must have been trained on exactly the features
+    # this version of the code builds. Mismatch = stale final_model.pkl.
+    ok, missing, unexpected = check_model_compatibility(model, feature_cols)
+    if not ok:
+        st.error(
+            "final_model.pkl doesn't match the current feature code - it was "
+            "most likely trained with an older version of the pipeline.\n\n"
+            "Fix: run `python train_model.py` (or re-run the notebook) to "
+            "rebuild final_model.pkl, then restart the app."
+        )
+        with st.expander("Technical details"):
+            st.write("Features the model expects but the code no longer builds:", missing)
+            st.write("Features the code builds but the model never saw:", unexpected)
         st.stop()
 
     with st.spinner("Generating forecast..."):
-        future_df = recursive_forecast(model, daily, feature_cols, horizon)
+        future_df = recursive_forecast(model, weekly, feature_cols, horizon)
 
     combined = pd.concat([
-        daily.assign(type="Historical"),
+        weekly.assign(type="Historical"),
         future_df.assign(type="Forecast"),
     ])
     chart_data = combined.pivot(index="date", columns="type", values="sales")
@@ -132,4 +147,4 @@ with tab_forecast:
         mime="text/csv",
     )
 
-st.caption("Model: loaded from final_model.pkl, trained on daily-aggregated historical sales with lag/rolling/calendar features.")
+st.caption("Model: loaded from final_model.pkl, trained on weekly-aggregated historical sales with lag/rolling/EWM/calendar/holiday/external features.")
